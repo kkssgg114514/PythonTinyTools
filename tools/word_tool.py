@@ -1,21 +1,29 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 from docx import Document
+from docx.oxml.ns import qn
+from docx.shared import Pt
+
+TITLE_FONT_NAME = "方正小标宋简体"
+BODY_FONT_NAME = "仿宋_GB2312"
+TITLE_FONT_SIZE = Pt(22)
+BODY_FONT_SIZE = Pt(16)
 
 
 def resolve_path(path_text: str) -> Path:
     return Path(path_text).expanduser().resolve()
 
 
-def ensure_docx_path(path: Path) -> None:
+def ensure_docx_file(path: Path) -> None:
     if path.suffix.lower() != ".docx":
-        raise ValueError("当前工具的编辑功能只支持 .docx 文件。")
+        raise ValueError("当前脚本仅支持 .docx 文件。")
+    if not path.exists():
+        raise FileNotFoundError(f"文件不存在: {path}")
 
 
 def iter_paragraphs(container) -> Iterable:
@@ -27,114 +35,64 @@ def iter_paragraphs(container) -> Iterable:
             for row in table.rows:
                 for cell in row.cells:
                     yield from iter_paragraphs(cell)
-    if hasattr(container, "sections"):
-        for section in container.sections:
-            yield from iter_paragraphs(section.header)
-            yield from iter_paragraphs(section.footer)
 
 
-def open_in_default_app(path: Path) -> None:
-    if not path.exists():
-        raise FileNotFoundError(f"文件不存在: {path}")
-    os.startfile(path)
-    print(f"已打开: {path}")
+def find_title_paragraph(document: Document):
+    for paragraph in iter_paragraphs(document):
+        if paragraph.text.strip():
+            return paragraph
+    return None
 
 
-def create_document(path: Path, title: str | None, paragraphs: list[str]) -> None:
-    ensure_docx_path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    document = Document()
-    if title:
-        document.add_heading(title, level=1)
-    for paragraph in paragraphs:
-        document.add_paragraph(paragraph)
-    document.save(path)
-    print(f"已创建文档: {path}")
+def apply_run_style(run, font_name: str, font_size: Pt) -> None:
+    run.font.name = font_name
+    run.font.size = font_size
+    r_fonts = run._element.rPr.rFonts
+    for font_key in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
+        r_fonts.set(qn(font_key), font_name)
 
 
-def append_paragraphs(path: Path, paragraphs: list[str]) -> None:
-    ensure_docx_path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"文件不存在: {path}")
+def apply_paragraph_style(paragraph, font_name: str, font_size: Pt) -> None:
+    if not paragraph.text.strip():
+        return
+    for run in paragraph.runs:
+        apply_run_style(run, font_name, font_size)
+
+
+def standardize_document(path: Path) -> tuple[int, int]:
+    ensure_docx_file(path)
 
     document = Document(path)
-    for paragraph in paragraphs:
-        document.add_paragraph(paragraph)
-    document.save(path)
-    print(f"已追加 {len(paragraphs)} 段内容到: {path}")
+    title_paragraph = find_title_paragraph(document)
+    if title_paragraph is None:
+        raise ValueError("文档中没有可处理的非空段落。")
 
-
-def replace_text(path: Path, old_text: str, new_text: str) -> int:
-    ensure_docx_path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"文件不存在: {path}")
-    if not old_text:
-        raise ValueError("--old 不能为空。")
-
-    document = Document(path)
-    replaced_count = 0
+    title_element = title_paragraph._element
+    title_count = 0
+    body_count = 0
 
     for paragraph in iter_paragraphs(document):
-        current_text = paragraph.text
-        if old_text not in current_text:
+        if not paragraph.text.strip():
             continue
-        replaced_count += current_text.count(old_text)
-        # 直接替换整段文本，能覆盖跨 run 的情况，但该段原有局部样式会被重建。
-        paragraph.text = current_text.replace(old_text, new_text)
+        if paragraph._element is title_element:
+            apply_paragraph_style(paragraph, TITLE_FONT_NAME, TITLE_FONT_SIZE)
+            title_count += 1
+            continue
+        apply_paragraph_style(paragraph, BODY_FONT_NAME, BODY_FONT_SIZE)
+        body_count += 1
 
     document.save(path)
-    return replaced_count
+    return title_count, body_count
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="打开并编辑 Word 文档（编辑功能支持 .docx）。"
+        description="标准化 Word .docx 文档格式，并覆盖原文件。"
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    open_parser = subparsers.add_parser("open", help="用系统默认程序打开文档。")
-    open_parser.add_argument("path", help="Word 文档路径。")
-
-    create_parser = subparsers.add_parser("create", help="创建一个新的 .docx 文档。")
-    create_parser.add_argument("path", help="目标 .docx 路径。")
-    create_parser.add_argument("--title", help="文档标题。")
-    create_parser.add_argument(
-        "--text",
-        action="append",
-        default=[],
-        help="文档段落内容。可重复传入多次。",
+    parser.add_argument(
+        "path",
+        help="要处理的 Word .docx 文件路径，支持绝对路径或相对路径。",
     )
-    create_parser.add_argument(
-        "--open-after",
-        action="store_true",
-        help="创建后立即打开文档。",
-    )
-
-    append_parser = subparsers.add_parser("append", help="向现有 .docx 末尾追加段落。")
-    append_parser.add_argument("path", help="目标 .docx 路径。")
-    append_parser.add_argument(
-        "--text",
-        action="append",
-        required=True,
-        help="要追加的段落内容。可重复传入多次。",
-    )
-    append_parser.add_argument(
-        "--open-after",
-        action="store_true",
-        help="追加后立即打开文档。",
-    )
-
-    replace_parser = subparsers.add_parser("replace", help="替换 .docx 中的文本。")
-    replace_parser.add_argument("path", help="目标 .docx 路径。")
-    replace_parser.add_argument("--old", required=True, help="要被替换的文本。")
-    replace_parser.add_argument("--new", required=True, help="替换成的新文本。")
-    replace_parser.add_argument(
-        "--open-after",
-        action="store_true",
-        help="替换后立即打开文档。",
-    )
-
     return parser
 
 
@@ -144,35 +102,14 @@ def main() -> int:
 
     try:
         path = resolve_path(args.path)
-
-        if args.command == "open":
-            open_in_default_app(path)
-            return 0
-
-        if args.command == "create":
-            create_document(path, args.title, args.text)
-            if args.open_after:
-                open_in_default_app(path)
-            return 0
-
-        if args.command == "append":
-            append_paragraphs(path, args.text)
-            if args.open_after:
-                open_in_default_app(path)
-            return 0
-
-        if args.command == "replace":
-            replaced_count = replace_text(path, args.old, args.new)
-            print(f"已完成替换，匹配次数: {replaced_count}")
-            if args.open_after:
-                open_in_default_app(path)
-            return 0
+        title_count, body_count = standardize_document(path)
+        print(f"处理完成: {path}")
+        print(f"标题段落: {title_count}")
+        print(f"正文段落: {body_count}")
+        return 0
     except Exception as exc:  # pragma: no cover
         print(f"执行失败: {exc}", file=sys.stderr)
         return 1
-
-    parser.print_help()
-    return 1
 
 
 if __name__ == "__main__":
